@@ -5,13 +5,19 @@ import gzip
 import pprint
 import StringIO
 import requests
+import hashlib
+import binascii
+import struct
 
 from google.protobuf import descriptor
 from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 from google.protobuf import text_format
 from google.protobuf.message import Message, DecodeError
 
+from OpenSSL import crypto
 from OpenSSL.SSL import Error as SSLError
+from Crypto.Cipher import PKCS1_OAEP as pkcs
+from Crypto.PublicKey.RSA import construct
 
 import googleplay_pb2
 import config
@@ -24,6 +30,8 @@ try:
 except (SSLError, IOError) as e:
     ssl_verify=True
     requests.post(conn_test_url, verify=ssl_verify)
+
+GOOGLE_PUBKEY = "AAAAgMom/1a/v0lblO2Ubrt60J2gcuXSljGFQXgcyZWveWLEwo6prwgi3iJIZdodyhKZQrNWp5nKJ3srRXcUW+F1BD3baEVGcmEgqaLZUNBjm057pKRI16kB0YppeGx5qIQ5QjKzsR8ETQbKLNWgRY0QRNVz34kMJR3P/LgHax/6rmf5AAAAAwEAAQ=="
 
 
 class LoginError(Exception):
@@ -119,18 +127,18 @@ class GooglePlayAPI(object):
             if (email is None or password is None):
                 raise Exception("You should provide at least authSubToken or (email and password)")
             params = {"Email": email,
-                                "Passwd": password,
-                                "service": self.SERVICE,
-                                "accountType": self.ACCOUNT_TYPE_HOSTED_OR_GOOGLE,
-                                "has_permission": "1",
-                                "source": "android",
-                                "androidId": self.androidId,
-                                "app": "com.android.vending",
-                                #"client_sig": self.client_sig,
-                                "device_country": "fr",
-                                "operatorCountry": "fr",
-                                "lang": "fr",
-                                "sdk_version": "19"}
+                      "EncryptedPasswd": self.encryptPasswd(email, password),
+                      "service": self.SERVICE,
+                      "accountType": self.ACCOUNT_TYPE_HOSTED_OR_GOOGLE,
+                      "has_permission": "1",
+                      "source": "android",
+                      "androidId": self.androidId,
+                      "app": "com.android.vending",
+                      #"client_sig": self.client_sig,
+                      "device_country": "fr",
+                      "operatorCountry": "fr",
+                      "lang": "fr",
+                      "sdk_version": "19"}
             headers = {
                 "Accept-Encoding": "",
             }
@@ -147,6 +155,51 @@ class GooglePlayAPI(object):
                 raise LoginError("server says: " + params["error"])
             else:
                 raise LoginError("Auth token not found.")
+
+    def encryptPasswd(self, email, password):
+        combined = email + "\x00" + password
+        rsa_pubkey = self.pubKey()
+        cipher = pkcs.new(rsa_pubkey)
+        encrypted = cipher.encrypt(combined)
+        encoded = base64.b64encode(self.keySignature() + encrypted)
+        encoded = encoded.replace('+', '-')\
+                         .replace('/', '_')
+        return encoded
+
+    def binaryKey(self):
+        try:
+            return self.binary_key
+        except AttributeError:
+            self.binary_key = base64.b64decode(GOOGLE_PUBKEY)
+            return self.binary_key
+
+    def pubKey(self):
+        binary_key = self.binaryKey()
+        mod_s = self.readInt(binary_key, 0)
+        mod = self.toBigInt(binary_key[4:mod_s+4])
+
+        binary_key = binary_key[mod_s+4:]
+
+        pub_exp_s = self.readInt(binary_key, 0)
+        pub_exp = self.toBigInt(binary_key[4:pub_exp_s+4])
+
+        return construct((mod, pub_exp))
+
+    def keySignature(self):
+        try:
+            return self.key_signature
+        except AttributeError:
+            sha1 = hashlib.sha1()
+            sha1.update(self.binaryKey())
+            self.key_signature = binascii.unhexlify(sha1.hexdigest())[:5]
+            return self.key_signature
+
+    def readInt(self, binary_string, offset):
+        return struct.unpack('>L', binary_string[offset:offset+4])[0]
+
+    def toBigInt(self, binary_string):
+        hex_string = binascii.hexlify(binary_string)
+        return long(hex_string, 16)
 
     def executeRequestApi2(self, path, datapost=None, post_content_type="application/x-www-form-urlencoded; charset=UTF-8"):
         if (datapost is None and path in self.preFetch):
